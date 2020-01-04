@@ -1,5 +1,6 @@
 ### XOR solvable activation function helps DNNs
 Author: Sungguk Cha
+
 eMail : navinad@naver.com
 
 ### Introduction
