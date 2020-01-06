@@ -7,8 +7,26 @@ r'''
         XOR solvable activation applied resnet.
 '''
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.utils.model_zoo as model_zoo
+
+from torch.autograd import Variable
+
+threshold = 0.8
+
+model_urls = {
+    'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
+    'resnet34': 'https://download.pytorch.org/models/resnet34-333f7ec4.pth',
+    'resnet50': 'https://download.pytorch.org/models/resnet50-19c8e357.pth',
+    'resnet101': 'https://download.pytorch.org/models/resnet101-5d3b4d8f.pth',
+    'resnet152': 'https://download.pytorch.org/models/resnet152-b121ed2d.pth',
+    'resnext50_32x4d': 'https://download.pytorch.org/models/resnext50_32x4d-7cdf4587.pth',
+    'resnext101_32x8d': 'https://download.pytorch.org/models/resnext101_32x8d-8ba56ff5.pth',
+    'wide_resnet50_2': 'https://download.pytorch.org/models/wide_resnet50_2-95faca4d.pth',
+    'wide_resnet101_2': 'https://download.pytorch.org/models/wide_resnet101_2-32ee1156.pth',
+}
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     """3x3 convolution with padding"""
@@ -21,26 +39,23 @@ def conv1x1(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 class XOR(torch.autograd.Function):
-    def __init__(self, conv, double=False):
-        self.th = 0.8 if not double else 1.6
-        for s in conv.weight.shape:
-            self.th *= s
-
     @staticmethod
-    def forward(ctx, input):
-        ctx.save_for_backward(input)
+    def forward(ctx, input, th):
+        _th = Variable( torch.from_numpy(np.array([th])).cuda() , requires_grad=False)
+        ctx.save_for_backward(input, _th)
         x = input.clone()
         x[ x < 0 ] = 0
-        x[ x > self.th ] = 0
+        x[ x > th ] = 0
         return x
 
     @staticmethod
     def backward(ctx, grad_output):
-        input, = ctx.saved_tensors
+        input, th, = ctx.saved_tensors
+        th = th.data[0]
         grad_input = grad_output.clone()
         grad_input[input < 0] = 0
-        grad_input[input > self.th ] = 0
-        return grad_input
+        grad_input[input > th ] = 0
+        return grad_input, None
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -56,12 +71,15 @@ class BasicBlock(nn.Module):
         if dilation > 1:
             raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
         # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.realu = XOR.apply
         self.conv1 = conv3x3(inplanes, planes, stride)
         self.bn1 = norm_layer(planes)
-        self.act1 = XOR(self.conv1).apply
+        self.th1 = threshold
+        for s in self.conv1.weight.shape: self.th1 *= s
         self.conv2 = conv3x3(planes, planes)
         self.bn2 = norm_layer(planes)
-        self.act2 = XOR(self.conv2, double=True).apply
+        self.th2 = threshold * 2
+        for s in self.conv2.weight.shape: self.th2 *= s
         self.downsample = downsample
         self.stride = stride
 
@@ -70,7 +88,7 @@ class BasicBlock(nn.Module):
 
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.act1(out)
+        out = self.realu(out, self.th1)
 
         out = self.conv2(out)
         out = self.bn2(out)
@@ -79,7 +97,7 @@ class BasicBlock(nn.Module):
             identity = self.downsample(x)
 
         out += identity
-        out = self.act2(out)
+        out = self.realu(out, self.th2)
 
         return out
 
@@ -95,15 +113,19 @@ class Bottleneck(nn.Module):
             norm_layer = nn.BatchNorm2d
         width = int(planes * (base_width / 64.)) * groups
         # Both self.conv2 and self.downsample layers downsample the input when stride != 1
+        self.realu = XOR.apply
         self.conv1 = conv1x1(inplanes, width)
         self.bn1 = norm_layer(width)
-        self.act1 = XOR(self.conv1).apply
+        self.th1 = threshold
+        for s in self.conv1.weight.shape: self.th1 *= s
         self.conv2 = conv3x3(width, width, stride, groups, dilation)
         self.bn2 = norm_layer(width)
-        self.act2 = XOR(self.conv2).apply
+        self.th2 = threshold
+        for s in self.conv2.weight.shape: self.th2 *= s
         self.conv3 = conv1x1(width, planes * self.expansion)
         self.bn3 = norm_layer(planes * self.expansion)
-        self.act3 = XOR(self.conv3, double=True).apply
+        self.th3 = threshold
+        for s in self.conv3.weight.shape: self.th3 *= s
         self.downsample = downsample
         self.stride = stride
 
@@ -112,11 +134,11 @@ class Bottleneck(nn.Module):
 
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.act1(out)
+        out = self.realu(out, self.th1)
 
         out = self.conv2(out)
         out = self.bn2(out)
-        out = self.act2(out)
+        out = self.realu(out, self.th2)
 
         out = self.conv3(out)
         out = self.bn3(out)
@@ -125,7 +147,7 @@ class Bottleneck(nn.Module):
             identity = self.downsample(x)
 
         out += identity
-        out = self.act3(out)
+        out = self.realu(out, self.th3)
 
         return out
 
@@ -151,10 +173,12 @@ class ResNet(nn.Module):
                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
+        self.realu = XOR.apply
         self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3,
                                bias=False)
         self.bn1 = norm_layer(self.inplanes)
-        self.act1 = XOR(self.conv1).apply
+        self.th1 = threshold
+        for s in self.conv1.weight.shape: self.th1 *= s
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
@@ -211,7 +235,7 @@ class ResNet(nn.Module):
         # See note [TorchScript super()]
         x = self.conv1(x)
         x = self.bn1(x)
-        x = self.relu(x)
+        x = self.realu(x, self.th1)
         x = self.maxpool(x)
 
         x = self.layer1(x)
@@ -232,9 +256,15 @@ class ResNet(nn.Module):
 def _resnet(arch, block, layers, pretrained, progress, **kwargs):
     model = ResNet(block, layers, **kwargs)
     if pretrained:
-        state_dict = load_state_dict_from_url(model_urls[arch],
-                                              progress=progress)
+        pretrained_dict = model_zoo.load_url(model_urls[arch])
+        model_dict = {}
+        state_dict = model.state_dict()
+        for k, v in pretrained_dict.items():
+            if k in state_dict:
+                model_dict[k] = v
+        state_dict.update(model_dict)
         model.load_state_dict(state_dict)
+        
     return model
 
 
